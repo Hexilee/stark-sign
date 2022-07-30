@@ -1,7 +1,6 @@
 package starksign
 
 import (
-	"crypto/elliptic"
 	"crypto/sha256"
 	"fmt"
 	"math/big"
@@ -38,6 +37,10 @@ type (
 	ECSignature struct {
 		R, S *big.Int
 	}
+
+	ECPoint struct {
+		X, Y *big.Int
+	}
 )
 
 const (
@@ -49,7 +52,7 @@ func generateKWithSeed(hash, privateKey *big.Int, seed int64) *big.Int {
 	qlen := hash.BitLen()
 	rolen := (qlen + 7) >> 3
 	// Pad the message hash, for consistency with the elliptic.js library.
-	if qlen >= 1 && qlen <= 4 && qlen >= 248 {
+	if qlen%8 >= 1 && qlen%8 <= 4 && qlen >= 248 {
 		hash = new(big.Int).Mul(hash, big.NewInt(16))
 	}
 
@@ -57,7 +60,7 @@ func generateKWithSeed(hash, privateKey *big.Int, seed int64) *big.Int {
 	if seed != 0 {
 		extraEntropy = int2octets(big.NewInt(seed), qlen)
 	}
-	return generateK(EC_ORDER, hash, sha256.New, int2octets(privateKey, rolen), extraEntropy)
+	return generateK(EC_ORDER, privateKey, sha256.New, int2octets(hash, rolen), extraEntropy)
 }
 
 func Sign(hash, privateKey *big.Int, seed int64) (*ECSignature, error) {
@@ -73,24 +76,24 @@ func Sign(hash, privateKey *big.Int, seed int64) (*ECSignature, error) {
 		return nil, fmt.Errorf("hash is invalid")
 	}
 
-	curve := &elliptic.CurveParams{
-		P:       FIELD_PRIME,
-		B:       BETA,
-		N:       EC_ORDER,
-		Gx:      GX,
-		Gy:      GY,
-		BitSize: N_ELEMENT_BITS_ECDSA,
-		Name:    "Stark Curve",
+	ecBase := &ECPoint{
+		X: GX,
+		Y: GY,
 	}
 
 	for {
 		k := generateKWithSeed(hash, privateKey, seed)
 		//  Update seed for next iteration in case the value of k is bad.
+
 		seed++
 
-		x, _ := curve.ScalarBaseMult(k.Bytes())
+		p, err := ecMult(ecBase, k, big.NewInt(ALPHA), FIELD_PRIME)
+		if err != nil {
+			return nil, err
+		}
 		// DIFF: in classic ECDSA, we take x % n.
-		r := x
+		r := p.X
+
 		if !validBigInt(1, r) {
 			// Bad value. This fails with negligible probability.
 			continue
@@ -112,6 +115,67 @@ func Sign(hash, privateKey *big.Int, seed int64) (*ECSignature, error) {
 		s := big.NewInt(0).ModInverse(w, EC_ORDER)
 		return &ECSignature{R: r, S: s}, nil
 	}
+}
+
+// Multiplies by m a point on the elliptic curve with equation y^2 = x^3 + alpha*x + beta mod p.
+// Assumes the point is given in affine form (x, y) and that 0 < m < order(point).
+func ecMult(point *ECPoint, m, alpha, p *big.Int) (*ECPoint, error) {
+	if m.Cmp(big.NewInt(1)) == 0 {
+		return point, nil
+	}
+
+	if new(big.Int).Mod(m, big.NewInt(2)).Cmp(big.NewInt(0)) == 0 {
+		doubleP, err := ecDouble(point, alpha, p)
+		if err != nil {
+			return nil, err
+		}
+		return ecMult(doubleP, new(big.Int).Div(m, big.NewInt(2)), alpha, p)
+	}
+
+	multP, err := ecMult(point, new(big.Int).Sub(m, big.NewInt(1)), alpha, p)
+	if err != nil {
+		return nil, err
+	}
+	return ecAdd(multP, point, p)
+}
+
+// Gets two points on an elliptic curve mod p and returns their sum.
+// Assumes the points are given in affine form (x, y) and have different x coordinates.
+func ecAdd(point1, point2 *ECPoint, p *big.Int) (*ECPoint, error) {
+	// (x1 - x2) % p == 0
+	if new(big.Int).Mod(new(big.Int).Sub(point1.X, point2.X), p).Cmp(big.NewInt(0)) == 0 {
+		return nil, fmt.Errorf("invalid points")
+	}
+
+	// m = (y1 - y2) / (x1 - x2) % p
+	m := divMod(new(big.Int).Sub(point1.Y, point2.Y), new(big.Int).Sub(point1.X, point2.X), p)
+
+	// x = m^2 - x1 - x2
+	x := new(big.Int).Sub(new(big.Int).Sub(new(big.Int).Mul(m, m), point1.X), point2.X)
+
+	// y = m * (x1 - x) - y1
+	y := new(big.Int).Sub(new(big.Int).Mul(m, new(big.Int).Sub(point1.X, x)), point1.Y)
+
+	return &ECPoint{X: new(big.Int).Mod(x, p), Y: new(big.Int).Mod(y, p)}, nil
+}
+
+// Doubles a point on an elliptic curve with the equation y^2 = x^3 + alpha*x + beta mod p.
+// Assumes the point is given in affine form (x, y) and has y != 0.
+func ecDouble(point *ECPoint, alpha *big.Int, p *big.Int) (*ECPoint, error) {
+	if new(big.Int).Mod(point.X, p).Cmp(big.NewInt(0)) == 0 {
+		return nil, fmt.Errorf("invalid point")
+	}
+
+	// m = (3 * x1**2 + alpha) / (2 * y1) % p
+	m := divMod(new(big.Int).Add(new(big.Int).Mul(new(big.Int).Mul(point.X, point.X), big.NewInt(3)), alpha), new(big.Int).Mul(big.NewInt(2), point.Y), p)
+
+	// x = (m**2 - 2 * x1) % p
+	x := new(big.Int).Mod(new(big.Int).Sub(new(big.Int).Mul(m, m), new(big.Int).Mul(big.NewInt(2), point.X)), p)
+
+	// y = (m * (x1 - x) - y1) % p
+	y := new(big.Int).Mod(new(big.Int).Sub(new(big.Int).Mul(m, new(big.Int).Sub(point.X, x)), point.Y), p)
+
+	return &ECPoint{X: x, Y: y}, nil
 }
 
 // Finds a nonnegative integer 0 <= x < p such that (m * x) % p == n
